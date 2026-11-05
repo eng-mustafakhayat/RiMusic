@@ -44,10 +44,7 @@ internal fun MyDownloadHelper.createSimpleDataSourceFactory(): DataSource.Factor
             .setCache(getDownloadCache(appContext()))
             .setUpstreamDataSourceFactory(
                 OkHttpDataSource.Factory(
-                    OkHttpClient
-                        .Builder()
-                        .proxy(Environment.proxy)
-                        .build(),
+                    Environment.okHttpClientBuilder().build(),
                 ),
             )
     ) { dataSpec ->
@@ -69,17 +66,26 @@ internal fun MyDownloadHelper.createSimpleDataSourceFactory(): DataSource.Factor
         }
 
         val playedFormat = runBlocking(Dispatchers.IO) { Database.format(mediaId).first() }
+        // Try the selected streaming type first, then fall back to the others. A single
+        // client being rejected by YouTube (403 / missing PoToken) previously failed the download.
         val playbackData = runBlocking(Dispatchers.IO) {
-            SelectSimplePlayerType(
-                mediaId,
-                playedFormat,
-                audioQualityFormat
-            )
-//            SimplePlayer.playerResponseForPlayback(
-//                mediaId,
-//                playedFormat = playedFormat,
-//                audioQuality = audioQualityFormat,
-//            )
+            var result = SelectSimplePlayerType(mediaId, playedFormat, audioQualityFormat)
+            if (result.isFailure) {
+                Timber.e("MyDownloadHelper primary player failed for $mediaId: ${result.exceptionOrNull()}")
+                result = SimplePlayer.playerResponseForPlayback(
+                    mediaId,
+                    playedFormat = null, // allow any audio format, the played one may be unavailable
+                    audioQuality = audioQualityFormat,
+                )
+            }
+            if (result.isFailure) {
+                result = SimplePlayer.playerResponseForPlaybackWithPotoken(
+                    mediaId,
+                    playedFormat = null,
+                    audioQuality = audioQualityFormat,
+                )
+            }
+            result
         }.getOrThrow()
         val format = playbackData.format
 
@@ -93,7 +99,8 @@ internal fun MyDownloadHelper.createSimpleDataSourceFactory(): DataSource.Factor
                         //codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
                         bitrate = format.bitrate.toLong(),
                         //sampleRate = format.audioSampleRate,
-                        contentLength = format.contentLength!!,
+                        // contentLength can be null for some clients, `!!` crashed the download
+                        contentLength = format.contentLength ?: 0L,
                         loudnessDb = playbackData.audioConfig?.loudnessDb,
                         //playbackUrl = playbackData.playbackTracking?.videostatsPlaybackUrl?.baseUrl
                     ),

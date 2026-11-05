@@ -20,8 +20,10 @@ import java.net.Proxy
 
 private class NewPipeDownloaderImpl(proxy: Proxy?) : Downloader() {
 
-    private val client = OkHttpClient.Builder()
-        .proxy(proxy)
+    // Shares timeouts + DoH-with-fallback with the rest of the app. Previously this client had
+    // no DoH and default timeouts, so signature/player-JS fetches could fail or hang.
+    private val client = Environment.okHttpClientBuilder()
+        .apply { proxy?.let { proxy(it) } }
         .build()
 
     @Throws(IOException::class, ReCaptchaException::class)

@@ -69,6 +69,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.Dns
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.dnsoverhttps.DnsOverHttps
@@ -109,6 +110,75 @@ object Environment {
     val _0WL1AVN5v3 = EnvironmentPreferences.preference?.p42 ?: ""
     val _p4N2lun1CR = EnvironmentPreferences.preference?.p43 ?: ""
 
+    /**
+     * DNS resolver that tries DNS-over-HTTPS first and falls back to the system resolver
+     * if the DoH provider is unreachable/blocked. Before this, a blocked DoH endpoint made
+     * every request fail with UnknownHostException (looks like "infinite loading").
+     */
+    private class FallbackDns(
+        private val primary: Dns,
+        private val fallback: Dns = Dns.SYSTEM
+    ) : Dns {
+        override fun lookup(hostname: String): List<InetAddress> =
+            try {
+                primary.lookup(hostname)
+            } catch (e: Exception) {
+                fallback.lookup(hostname)
+            }
+    }
+
+    private fun buildDns(): Dns? {
+        val selected = this@Environment.dnsToUse ?: return null
+
+        // The bootstrap client needs its own short timeouts, otherwise a blocked DoH
+        // endpoint blocks the caller thread for the OkHttp default (10s per attempt).
+        val bootstrapClient = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .build()
+
+        fun doh(url: String, vararg bootstrap: String): Dns =
+            DnsOverHttps.Builder().client(bootstrapClient)
+                .url(url.toHttpUrl())
+                .apply {
+                    if (bootstrap.isNotEmpty())
+                        bootstrapDnsHosts(bootstrap.map { InetAddress.getByName(it) })
+                }
+                .build()
+
+        val dohDns: Dns = runCatching {
+            when (selected) {
+                "cloudflare" -> doh("https://cloudflare-dns.com/dns-query", "1.1.1.1", "1.0.0.1")
+                "opendns" -> doh("https://doh.opendns.com/dns-query", "208.67.222.222", "208.67.220.220")
+                "adguard" -> doh("https://unfiltered.adguard-dns.com/dns-query")
+                "custom" -> this@Environment.customDnsToUse
+                    ?.let { doh(it) }
+                    ?: doh("https://dns.google/dns-query", "8.8.8.8", "8.8.4.4")
+                else -> doh("https://dns.google/dns-query", "8.8.8.8", "8.8.4.4")
+            }
+        }.getOrElse {
+            // invalid custom URL etc. must not crash client creation
+            doh("https://dns.google/dns-query", "8.8.8.8", "8.8.4.4")
+        }
+
+        return FallbackDns(dohDns)
+    }
+
+    /**
+     * Shared OkHttp builder (proxy + DoH with fallback + sane timeouts) for every component
+     * that talks to YouTube outside of ktor: downloader, NewPipe, stream validation.
+     */
+    fun okHttpClientBuilder(): OkHttpClient.Builder =
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .apply {
+                this@Environment.proxy?.let { proxy(it) }
+                buildDns()?.let { dns(it) }
+            }
+
     private fun buildClient() = HttpClient(OkHttp) {
 
         expectSuccess = true
@@ -141,52 +211,28 @@ object Environment {
 
 
         engine {
+            // Logging full request/response bodies is very expensive (browse responses are
+            // several hundred KB of JSON) and was a cause of UI stalls. Keep it off by default.
             addInterceptor(
                 HttpLoggingInterceptor().apply {
-                    level = HttpLoggingInterceptor.Level.BODY
+                    level = HttpLoggingInterceptor.Level.NONE
                 }
             )
 
-
-
-            if (this@Environment.dnsToUse != null) {
-               // Used in memory cache insted of this, it seems that actually there is a bug in file cache with ktor
-               // val dnsCache = Cache(File("cacheDir", "okhttpcache"), 10 * 1024 * 1024)
-               // val bootstrapClient = OkHttpClient.Builder().cache(dnsCache).build()
-                val bootstrapClient = OkHttpClient.Builder().build()
-                val googleDns = DnsOverHttps.Builder().client(bootstrapClient)
-                    .url("https://dns.google/dns-query".toHttpUrl())
-                    .bootstrapDnsHosts(InetAddress.getByName("8.8.8.8"), InetAddress.getByName("8.8.4.4")).build()
-                val cloudflareDns = DnsOverHttps.Builder().client(bootstrapClient)
-                    .url("https://cloudflare-dns.com/dns-query".toHttpUrl())
-                    .bootstrapDnsHosts(InetAddress.getByName("1.1.1.1"), InetAddress.getByName("1.0.0.1")).build()
-                val openDns = DnsOverHttps.Builder().client(bootstrapClient)
-                    .url("https://doh.opendns.com/dns-query".toHttpUrl())
-                    .bootstrapDnsHosts(InetAddress.getByName("208.67.222.222"), InetAddress.getByName("208.67.220.220")).build()
-                val adGuardDns = DnsOverHttps.Builder().client(bootstrapClient)
-                    .url("https://unfiltered.adguard-dns.com/dns-query".toHttpUrl()).build()
-                val customDns = this@Environment.customDnsToUse?.let {
-                    DnsOverHttps.Builder().client(bootstrapClient)
-                        .url(it.toHttpUrl()).build()
-                } ?: googleDns
-                val dns: DnsOverHttps = when (this@Environment.dnsToUse) {
-                    "google" -> googleDns
-                    "cloudflare" -> cloudflareDns
-                    "opendns" -> openDns
-                    "adguard" -> adGuardDns
-                    "custom" -> customDns
-                    else -> googleDns
-                }
-
-                val clientWithDns = bootstrapClient.newBuilder().dns(dns).build()
-                preconfigured = clientWithDns
+            buildDns()?.let { dns ->
+                preconfigured = OkHttpClient.Builder().dns(dns).build()
             }
 
             config {
                 followRedirects(true)
                 followSslRedirects(true)
                 retryOnConnectionFailure(true)
-                pingInterval(1, TimeUnit.SECONDS)
+                // Explicit timeouts: without them a blocked/slow endpoint hangs for minutes.
+                connectTimeout(15, TimeUnit.SECONDS)
+                readTimeout(30, TimeUnit.SECONDS)
+                writeTimeout(30, TimeUnit.SECONDS)
+                // NOTE: pingInterval(1s) was removed, an HTTP/2 ping every second is
+                // needless traffic and can drop healthy connections on flaky networks.
             }
 
         }

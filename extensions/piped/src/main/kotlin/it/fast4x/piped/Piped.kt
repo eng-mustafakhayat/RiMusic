@@ -33,8 +33,6 @@ import it.fast4x.piped.utils.ProxyPreferences
 import it.fast4x.piped.utils.getProxy
 import it.fast4x.piped.utils.runCatchingCancellable
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
@@ -75,11 +73,15 @@ object Piped {
             install(HttpRequestRetry) {
                 exponentialDelay()
                 maxRetries = 2
+                retryOnExceptionOrServerErrors(maxRetries = 2)
             }
 
+            // Old values (1s connect / 5s request) were far too short for public Piped instances
+            // (often slow or overloaded), so almost every call failed and retries piled up.
             install(HttpTimeout) {
-                connectTimeoutMillis = 1000L
-                requestTimeoutMillis = 5000L
+                connectTimeoutMillis = 10_000L
+                requestTimeoutMillis = 30_000L
+                socketTimeoutMillis = 30_000L
             }
 
             /*
@@ -100,7 +102,7 @@ object Piped {
             engine {
                 addInterceptor(
                     HttpLoggingInterceptor().apply {
-                    level = HttpLoggingInterceptor.Level.BODY
+                    level = HttpLoggingInterceptor.Level.NONE
                     }
                 )
             }
@@ -116,17 +118,16 @@ object Piped {
     }
 
 
-    private val mutex = Mutex()
+    // NOTE: requests used to be wrapped in a global Mutex, so one slow request blocked every
+    // other Piped call (infinite loading). Requests now run concurrently.
 
     private suspend fun request(
         session: Session,
         endpoint: String,
         block: HttpRequestBuilder.() -> Unit = { }
-    ) = mutex.withLock {
-        client.request(url = session.apiBaseUrl / endpoint) {
-            block()
-            header("Authorization", session.token)
-        }
+    ) = client.request(url = session.apiBaseUrl / endpoint) {
+        block()
+        header("Authorization", session.token)
     }
 
     private suspend fun HttpResponse.isOk() =
@@ -134,9 +135,50 @@ object Piped {
 
     private suspend fun HttpResponse.bodyAsText() = body<String>()
 
+    /**
+     * Fallback API endpoints used when the instances registry is unreachable.
+     * These are public instances and may change; users can still type a custom URL.
+     */
+    val fallbackInstanceUrls = listOf(
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://api.piped.private.coffee",
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.drgns.space",
+    )
+
     suspend fun getInstances() = runCatchingCancellable {
         client.get("https://piped-instances.kavin.rocks/").body<List<Instance>>()
     }
+
+    /** Returns the first instance URL (from [candidates]) whose /healthcheck answers. */
+    suspend fun firstWorkingInstance(candidates: List<String> = fallbackInstanceUrls): String? {
+        for (url in candidates) {
+            val ok = runCatchingCancellable {
+                client.get("${url.trimEnd('/')}/healthcheck").status.value in 200..299
+            }?.getOrNull() == true
+            if (ok) return url
+        }
+        return null
+    }
+
+    /**
+     * Tries to log in on [apiBaseUrl] first and, if that fails for network reasons,
+     * on each fallback instance. Returns the first successful session.
+     */
+    suspend fun loginWithFallback(apiBaseUrl: Url, username: String, password: String) =
+        runCatchingCancellable {
+            val candidates = (listOf(apiBaseUrl.toString()) + fallbackInstanceUrls)
+                .filter { it.isNotBlank() }
+                .distinct()
+            var last: Throwable? = null
+            for (candidate in candidates) {
+                val r = login(Url(candidate), username, password)
+                if (r?.isSuccess == true) return@runCatchingCancellable r.getOrThrow()
+                last = r?.exceptionOrNull()
+            }
+            throw last ?: IllegalStateException("No Piped instance reachable")
+        }
 
     suspend fun login(apiBaseUrl: Url, username: String, password: String) =
         runCatchingCancellable {

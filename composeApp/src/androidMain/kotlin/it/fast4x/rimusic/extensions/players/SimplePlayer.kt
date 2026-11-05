@@ -24,9 +24,7 @@ import okhttp3.OkHttpClient
 import timber.log.Timber
 
 object SimplePlayer {
-    private val httpClient = OkHttpClient.Builder()
-        .proxy(Environment.proxy)
-        .build()
+    private val httpClient by lazy { Environment.okHttpClientBuilder().build() }
 
     private val poTokenGenerator = PoTokenGenerator()
 
@@ -393,11 +391,15 @@ object SimplePlayer {
      */
     private fun validateStatus(url: String): Boolean {
         try {
+            // HEAD is rejected (403/405) by googlevideo for many stream URLs, which made valid
+            // streams look broken and forced fallbacks. A 1-byte ranged GET is what players do.
             val requestBuilder = okhttp3.Request.Builder()
-                .head()
+                .get()
+                .header("Range", "bytes=0-1")
                 .url(url)
-            val response = httpClient.newCall(requestBuilder.build()).execute()
-            return response.isSuccessful
+            httpClient.newCall(requestBuilder.build()).execute().use { response ->
+                return response.isSuccessful
+            }
         } catch (e: Exception) {
             Timber.e("SimplePlayer validateStatus Could not validate stream url: $url")
             println("SimplePlayer validateStatus Could not validate stream url: $url")

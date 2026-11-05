@@ -391,10 +391,28 @@ fun AccountsSettings() {
         if (loadInstances) {
             LaunchedEffect(Unit) {
                 isLoading = true
-                Piped.getInstances()?.getOrNull()?.let {
-                    instances = it
-                    //println("mediaItem Instances $it")
-                } ?: run { noInstances = true }
+                val fetched = Piped.getInstances()?.getOrNull()
+                if (!fetched.isNullOrEmpty()) {
+                    instances = fetched
+                } else {
+                    // Registry unreachable: use the built-in fallback list so the user can still connect.
+                    instances = Piped.fallbackInstanceUrls.map { url ->
+                        Instance(
+                            name = url.removePrefix("https://"),
+                            apiBaseUrl = Url(url),
+                            locationsFormatted = "",
+                            version = "",
+                            upToDate = true,
+                            isCdn = false,
+                            userCount = 0,
+                            lastChecked = java.time.LocalDateTime.now(),
+                            hasCache = false,
+                            usesS3 = false,
+                            imageProxyBaseUrl = Url(url),
+                            registrationDisabled = false
+                        )
+                    }
+                }
                 isLoading = false
                 showInstances = true
             }
@@ -407,8 +425,9 @@ fun AccountsSettings() {
             LaunchedEffect(Unit) {
                 coroutineScope.launch {
                     isLoading = true
-                    session = Piped.login(
-                        apiBaseUrl = Url(pipedApiBaseUrl), //instances[instanceSelected!!].apiBaseUrl,
+                    // Tries the chosen instance first, then automatically the fallback instances.
+                    session = Piped.loginWithFallback(
+                        apiBaseUrl = Url(pipedApiBaseUrl),
                         username = pipedUsername,
                         password = pipedPassword
                     )?.onFailure {
