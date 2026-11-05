@@ -94,6 +94,9 @@ import it.fast4x.rimusic.utils.ytAccountThumbnailKey
 import it.fast4x.rimusic.utils.ytCookieKey
 import it.fast4x.rimusic.utils.ytDataSyncIdKey
 import it.fast4x.rimusic.utils.ytVisitorDataKey
+import kotlinx.datetime.Clock
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.toLocalDateTime
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
@@ -405,7 +408,7 @@ fun AccountsSettings() {
                             upToDate = true,
                             isCdn = false,
                             userCount = 0,
-                            lastChecked = java.time.LocalDateTime.now(),
+                            lastChecked = Clock.System.now().toLocalDateTime(TimeZone.UTC),
                             hasCache = false,
                             usesS3 = false,
                             imageProxyBaseUrl = Url(url),
@@ -682,7 +685,6 @@ fun isYouTubeLoggedIn(): Boolean {
     val isLoggedIn = cookie?.let { parseCookieString(it) }?.contains("SAPISID") == true
     return isLoggedIn
 }
-
 
 
 
